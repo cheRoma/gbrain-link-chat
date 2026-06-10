@@ -91,6 +91,10 @@ export type CyclePhase =
   // Same brain-wide BudgetTracker + walltime-cap shape as
   // conversation_facts_backfill; the phase wrapper does its own per-source loop.
   | 'enrich_thin'
+  // Tier 0 chat distiller — deterministic, zero-LLM. Links orphan chat/
+  // capture pages to an auto-created per-project hub so they stop being
+  // orphans. Default OFF; opt-in via cycle.link_chat.enabled.
+  | 'link_chat'
   // v0.41.20.0 — SkillOpt-paper-grounded self-evolving skills. Default OFF;
   // walks skills with stale skillopt-benchmark.jsonl AND last_run_at >7d.
   // Per-skill cost cap $0.50; brain-wide cap $2.00. Bundled-skill safety
@@ -161,6 +165,9 @@ export const ALL_PHASES: CyclePhase[] = [
   // conversation_facts_backfill, BEFORE embed so enriched bodies get
   // chunked + embedded in the same cycle.
   'enrich_thin',
+  // Tier 0 chat distiller. After enrich_thin, BEFORE embed so auto-created
+  // project-hub stubs get chunked + embedded in the same cycle.
+  'link_chat',
   // v0.41.20.0 SkillOpt — self-evolving skills phase. Dispatch order
   // places it AFTER the main graph-mutating cluster (extract, patterns,
   // consolidate, calibration, conversation-facts) so any skill that
@@ -237,6 +244,8 @@ export const PHASE_SCOPE: Record<CyclePhase, PhaseScope> = {
   conversation_facts_backfill: 'source',
   // v0.41.39 (#1700) — per-source (wrapper loops listSources, same as above).
   enrich_thin: 'source',
+  // Tier 0 chat distiller — per-source (wrapper loops listSources).
+  link_chat: 'source',
   // v0.41.20.0 SkillOpt — global (walks the skills/ directory; per-skill
   // DB lock inside D14 handles cross-source coordination).
   skillopt: 'global',
@@ -280,6 +289,8 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   // v0.41.39 (#1700) — writes pages via put_page (per-page advisory-locked
   // internally too); coordinate via the cycle lock like the other writers.
   'enrich_thin',
+  // Tier 0 chat distiller — writes hub stub pages + links; needs lock.
+  'link_chat',
   // v0.41.20.0 SkillOpt — writes SKILL.md + skillopt/ artifacts; needs lock.
   // Per-skill lock (D14) is acquired inside runSkillOpt; this NEEDS_LOCK
   // entry covers the cycle-level coordination.
@@ -2103,6 +2114,33 @@ export async function runCycle(
         const { runPhaseEnrichThin } = await import('./cycle/enrich-thin.ts');
         const { result, duration_ms } = await timePhase(() =>
           runPhaseEnrichThin(engine, { dryRun, signal: opts.signal }),
+        );
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Tier 0 chat distiller: link_chat ────────────────────────
+    // Opt-in (default OFF). Deterministic, zero-LLM: links orphan chat/
+    // capture pages to an auto-created per-project hub so they stop being
+    // orphans. Mirrors the enrich_thin dispatch shape (skip when no engine).
+    if (phases.includes('link_chat')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'link_chat',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.link_chat');
+        const { runPhaseLinkChat } = await import('./cycle/link-chat.ts');
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseLinkChat(engine, { dryRun, signal: opts.signal }),
         );
         result.duration_ms = duration_ms;
         phaseResults.push(result);

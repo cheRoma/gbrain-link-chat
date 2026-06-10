@@ -2,6 +2,21 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.45.0] - 2026-06-16
+
+**Raw session captures stop piling up as orphans.** The SessionEnd capture hook writes every agent transcript to `chat/<date>-<project>-<id>` with no links, so each one lands as an orphan page and the orphan count climbs with every session. A new opt-in cycle phase links them automatically, with no model call.
+
+`link_chat` is deterministic and costs nothing. Each tick it finds orphan `chat/` pages, derives the project from the slug, ensures a per-project hub at `projects/<project>/_index`, and links the hub to the capture so the page gains an inbound link and stops being an orphan. The hub uses the `/_index` suffix that orphan reporting already excludes, so hubs never become orphans themselves. Idempotent by construction: once a page is linked it's no longer a candidate, so re-runs do nothing.
+
+Default OFF. The orphan-clearing pass only runs after you opt in.
+
+### Added
+- **`link_chat` cycle phase links orphan chat captures to per-project hubs.** Deterministic, zero-model. Finds orphan `chat/` pages, derives the project from the slug, auto-creates `projects/<project>/_index`, and adds a hub→capture link so the page is no longer an orphan. The hub's `/_index` suffix is already excluded from orphan reporting, so hubs don't become orphans and there is no hub chain. Opt-in via `cycle.link_chat.enabled` (default OFF); `cycle.link_chat.max_pages_per_tick` (default 50) bounds the per-source trickle. Pinned by `test/cycle-link-chat.test.ts`.
+
+### To take advantage of v0.42.45.0
+
+`gbrain upgrade`, then `gbrain config set cycle.link_chat.enabled true` to let autopilot link raw session captures to project hubs automatically. Leave it off to keep the current behavior unchanged.
+
 ## [0.42.44.0] - 2026-06-13
 
 ### Fixed
