@@ -6,12 +6,16 @@ All notable changes to GBrain will be documented in this file.
 
 **Raw session captures stop piling up as orphans.** The SessionEnd capture hook writes every agent transcript to `chat/<date>-<project>-<id>` with no links, so each one lands as an orphan page and the orphan count climbs with every session. A new opt-in cycle phase links them automatically, with no model call.
 
-`link_chat` is deterministic and costs nothing. Each tick it finds orphan `chat/` pages, derives the project from the slug, ensures a per-project hub at `projects/<project>/_index`, and links the hub to the capture so the page gains an inbound link and stops being an orphan. The hub uses the `/_index` suffix that orphan reporting already excludes, so hubs never become orphans themselves. Idempotent by construction: once a page is linked it's no longer a candidate, so re-runs do nothing.
+`link_chat` is deterministic and costs nothing. Each tick it finds orphan `chat/` pages, derives the project from the slug, and links a per-project hub to the capture so the page gains an inbound link and stops being an orphan. Idempotent by construction: once a page is linked it's no longer a candidate, so re-runs do nothing.
+
+It links into the hubs you already keep. If the brain has `projects/<name>/index` or `projects/<name>`, that page is the hub — including when the working directory and the page disagree about underscores and hyphens (`crm_detailing` finds `projects/crm-detailing/index`). Only when nothing matches does the phase create `projects/<project>/_index`, whose suffix orphan reporting already excludes. Without this, a brain grows a second hub namespace keyed on directory names, shadowing the structure its owner curated by hand.
+
+Sessions started somewhere that isn't a project — `/tmp`, a home directory, a generic `site` or `web` folder — are skipped instead of being turned into hubs. `cycle.link_chat.ignore_projects` replaces that list wholesale, which is how you name your own home directory.
 
 Default OFF. The orphan-clearing pass only runs after you opt in.
 
 ### Added
-- **`link_chat` cycle phase links orphan chat captures to per-project hubs.** Deterministic, zero-model. Finds orphan `chat/` pages, derives the project from the slug, auto-creates `projects/<project>/_index`, and adds a hub→capture link so the page is no longer an orphan. The hub's `/_index` suffix is already excluded from orphan reporting, so hubs don't become orphans and there is no hub chain. Opt-in via `cycle.link_chat.enabled` (default OFF); `cycle.link_chat.max_pages_per_tick` (default 50) bounds the per-source trickle. Pinned by `test/cycle-link-chat.test.ts`.
+- **`link_chat` cycle phase links orphan chat captures to per-project hubs.** Deterministic, zero-model. Finds orphan `chat/` pages, derives the project from the slug, resolves the hub (existing `projects/<name>/index` or `projects/<name>`, matched across underscore/hyphen spelling; `projects/<project>/_index` created only as a fallback), and adds a hub→capture link so the page is no longer an orphan. A hand-made hub always outranks an `_index` left by an earlier run, so brains that already accumulated duplicates converge on the real hub. Non-project working directories are skipped via `cycle.link_chat.ignore_projects`. Opt-in via `cycle.link_chat.enabled` (default OFF); `cycle.link_chat.max_pages_per_tick` (default 50) bounds the per-source trickle. Result details carry `hubs_reused` and `skipped_ignored` alongside the existing counters. Pinned by `test/cycle-link-chat.test.ts`.
 
 ### To take advantage of v0.42.67.0
 

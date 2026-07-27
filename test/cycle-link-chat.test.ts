@@ -154,3 +154,114 @@ describe('runPhaseLinkChat', () => {
     expect(hub).toBeNull();
   });
 });
+
+describe('runPhaseLinkChat — existing hub reuse', () => {
+  async function seedHub(slug: string) {
+    await engine.putPage(slug, {
+      type: 'hub',
+      title: slug,
+      compiled_truth: 'Hand-made project hub.',
+      timeline: '',
+      frontmatter: {},
+    });
+  }
+
+  test('links from an existing projects/<name> hub instead of minting an _index duplicate', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/vatutinki');
+    await seedChat('chat/2026-06-10-vatutinki-1b4e4efe');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.linked).toBe(1);
+    expect(r.details.hubs_created).toBe(0);
+    expect(await engine.getPage('projects/vatutinki/_index', { sourceId: 'default' })).toBeNull();
+
+    const backlinks = await engine.getBacklinks('chat/2026-06-10-vatutinki-1b4e4efe', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/vatutinki');
+  });
+
+  test('links from an existing projects/<name>/index hub', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/ks2builder/index');
+    await seedChat('chat/2026-06-10-ks2builder-1b4e4efe');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.hubs_created).toBe(0);
+    expect(await engine.getPage('projects/ks2builder/_index', { sourceId: 'default' })).toBeNull();
+
+    const backlinks = await engine.getBacklinks('chat/2026-06-10-ks2builder-1b4e4efe', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/ks2builder/index');
+  });
+
+  test('matches an existing hub across underscore/hyphen spelling', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/crm-detailing/index');
+    await seedChat('chat/2026-07-26-crm_detailing-f4aa0ece');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.hubs_created).toBe(0);
+    expect(await engine.getPage('projects/crm_detailing/_index', { sourceId: 'default' })).toBeNull();
+
+    const backlinks = await engine.getBacklinks('chat/2026-07-26-crm_detailing-f4aa0ece', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/crm-detailing/index');
+  });
+
+  test('prefers a real hub over a previously auto-created _index duplicate', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/crm-detailing/index');
+    await seedHub('projects/crm_detailing/_index'); // legacy duplicate from an earlier run
+    await seedChat('chat/2026-07-27-crm_detailing-88b08bbc');
+
+    await runPhaseLinkChat(engine, {});
+
+    const backlinks = await engine.getBacklinks('chat/2026-07-27-crm_detailing-88b08bbc', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/crm-detailing/index');
+    expect(backlinks.map((b) => b.from_slug)).not.toContain('projects/crm_detailing/_index');
+  });
+
+  test('still creates an _index hub when no existing hub matches', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedChat('chat/2026-06-10-brandnew-1b4e4efe');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.hubs_created).toBe(1);
+    expect(await engine.getPage('projects/brandnew/_index', { sourceId: 'default' })).toBeTruthy();
+  });
+});
+
+describe('runPhaseLinkChat — ignored directories', () => {
+  test('skips captures whose project is a non-project working directory', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedChat('chat/2026-07-26-tmp-90a07150');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.linked).toBe(0);
+    expect(r.details.skipped_ignored).toBe(1);
+    expect(await engine.getPage('projects/tmp/_index', { sourceId: 'default' })).toBeNull();
+  });
+
+  test('ignore list is configurable and replaces the default', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await engine.setConfig('cycle.link_chat.ignore_projects', 'roma');
+    await seedChat('chat/2026-07-26-roma-90a07150');
+    await seedChat('chat/2026-07-26-tmp-90a07151');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.skipped_ignored).toBe(1); // only `roma` is ignored now
+    expect(r.details.linked).toBe(1); // `tmp` is no longer on the list
+  });
+});

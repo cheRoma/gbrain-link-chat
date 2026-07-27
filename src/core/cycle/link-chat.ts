@@ -4,12 +4,22 @@
  * Deterministic, zero-LLM, ~$0 (only one-time hub-stub embeddings). The
  * SessionEnd capture hook writes raw Claude Code transcripts to
  * `chat/<date>-<project>-<shortid>` with no links, so every capture lands as
- * an orphan. This phase gives each orphan `chat/` page an INBOUND link from an
- * auto-created per-project hub (`projects/<project>/_index`) so it stops being
- * an orphan. The hub uses the `/_index` suffix that orphan-reporting already
- * excludes (see `shouldExclude` in commands/orphans.ts), so there is no
- * hub-chain regress. Idempotent by construction: a linked page is no longer an
- * orphan, so it is not re-considered on the next tick.
+ * an orphan. This phase gives each orphan `chat/` page an INBOUND link from a
+ * per-project hub so it stops being an orphan.
+ *
+ * The hub is the brain's OWN hub when it has one (`projects/<project>/index`,
+ * `projects/<project>`, matched across underscore/hyphen spelling); only when
+ * nothing matches does the phase create `projects/<project>/_index`. Linking
+ * into the existing structure rather than shadowing it is what keeps a brain
+ * from growing a parallel hub namespace keyed on working-directory names. The
+ * `/_index` fallback uses the suffix that orphan-reporting already excludes
+ * (see `shouldExclude` in commands/orphans.ts), so there is no hub-chain
+ * regress. Idempotent by construction: a linked page is no longer an orphan,
+ * so it is not re-considered on the next tick.
+ *
+ * Captures whose derived "project" is a non-project working directory (`tmp`,
+ * `home`, a user's own home-directory name) are skipped rather than turned
+ * into hubs — see `DEFAULT_IGNORED_PROJECTS`.
  *
  * Architecture mirrors `enrich-thin.ts` (per-source loop over `listSources`,
  * `PHASE_SCOPE='source'`), minus the LLM/budget machinery — linking is
@@ -21,6 +31,8 @@
  *   cycle.link_chat.enabled            (false)
  *   cycle.link_chat.max_pages_per_tick (50)      per source per tick
  *   cycle.link_chat.slug_prefix        ('chat/')
+ *   cycle.link_chat.ignore_projects    (DEFAULT_IGNORED_PROJECTS) comma-separated;
+ *                                      replaces the default list wholesale
  */
 
 import type { BrainEngine } from '../engine.ts';
@@ -59,18 +71,40 @@ export function deriveProjectFromSlug(slug: string): string | null {
   return project.length > 0 ? project : null;
 }
 
+/**
+ * Working directories that are not projects. The capture hook derives the
+ * project from the session's cwd, so sessions started from a home directory,
+ * `/tmp`, or a generic `site`/`web` folder would otherwise mint a hub for
+ * something that isn't a project. Replaced wholesale (not extended) by
+ * `cycle.link_chat.ignore_projects`, so an operator can name their own home
+ * directory — the one non-project name this list can't know in advance.
+ */
+const DEFAULT_IGNORED_PROJECTS = [
+  'tmp',
+  'home',
+  'projects',
+  'src',
+  'web',
+  'site',
+  'downloads',
+  'desktop',
+  'documents',
+];
+
 interface ResolvedConfig {
   enabled: boolean;
   maxPagesPerTick: number;
   slugPrefix: string;
+  ignoreProjects: Set<string>;
 }
 
 async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
   const get = (k: string) => engine.getConfig(`${CFG_PREFIX}.${k}`);
-  const [enabled, maxPages, slugPrefix] = await Promise.all([
+  const [enabled, maxPages, slugPrefix, ignoreProjects] = await Promise.all([
     get('enabled'),
     get('max_pages_per_tick'),
     get('slug_prefix'),
+    get('ignore_projects'),
   ]);
 
   const enabledFlag = (() => {
@@ -81,11 +115,52 @@ async function loadCfg(engine: BrainEngine): Promise<ResolvedConfig> {
 
   const n = maxPages != null ? parseInt(maxPages, 10) : NaN;
 
+  const ignoreList = (
+    ignoreProjects && ignoreProjects.trim() ? ignoreProjects.split(',') : DEFAULT_IGNORED_PROJECTS
+  )
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
+
   return {
     enabled: enabledFlag,
     maxPagesPerTick: Number.isFinite(n) && n >= 1 ? n : 50,
     slugPrefix: slugPrefix && slugPrefix.trim() ? slugPrefix.trim() : 'chat/',
+    ignoreProjects: new Set(ignoreList),
   };
+}
+
+/**
+ * Candidate hub slugs for a project, most canonical first. A brain that already
+ * keeps a hand-made hub (`projects/vatutinki`, `projects/ks2builder/index`)
+ * should be linked INTO rather than shadowed by a second `_index` hub. The
+ * underscore/hyphen variants catch the common mismatch between a working
+ * directory (`crm_detailing`) and the page that documents it
+ * (`projects/crm-detailing/index`).
+ */
+export function hubCandidates(project: string): string[] {
+  const names = [...new Set([project, project.replace(/_/g, '-'), project.replace(/-/g, '_')])];
+  // Hand-made hubs across EVERY spelling outrank an auto-created `_index` from
+  // an earlier run, so a brain that accumulated duplicates converges on the
+  // real hub instead of entrenching the split.
+  const canonical = names.flatMap((n) => [`projects/${n}/index`, `projects/${n}`]);
+  const autoCreated = names.map((n) => `projects/${n}/_index`);
+  return [...canonical, ...autoCreated];
+}
+
+/**
+ * Resolve the hub to link from: an existing page if the brain already has one,
+ * otherwise null (the caller then creates the `_index` stub).
+ */
+async function findExistingHub(
+  engine: BrainEngine,
+  project: string,
+  sourceId: string,
+): Promise<string | null> {
+  for (const slug of hubCandidates(project)) {
+    const page = await engine.getPage(slug, { sourceId });
+    if (page) return slug;
+  }
+  return null;
 }
 
 /**
@@ -138,7 +213,9 @@ export async function runPhaseLinkChat(
 
   let linked = 0;
   let hubsCreated = 0;
+  let hubsReused = 0;
   let skippedUnparseable = 0;
+  let skippedIgnored = 0;
   let wouldLink = 0;
   let chatOrphansTotal = 0;
   const perSource: Record<string, unknown> = {};
@@ -153,7 +230,9 @@ export async function runPhaseLinkChat(
     let processed = 0;
     let srcLinked = 0;
     let srcHubs = 0;
+    let srcReused = 0;
     let srcSkipped = 0;
+    let srcIgnored = 0;
     let srcWould = 0;
 
     for (const o of chatOrphans) {
@@ -164,6 +243,11 @@ export async function runPhaseLinkChat(
         srcSkipped++;
         continue;
       }
+      if (cfg.ignoreProjects.has(project.toLowerCase())) {
+        skippedIgnored++;
+        srcIgnored++;
+        continue;
+      }
       processed++;
 
       if (opts.dryRun) {
@@ -172,11 +256,17 @@ export async function runPhaseLinkChat(
         continue;
       }
 
-      const hubSlug = `projects/${project}/_index`;
-      const created = await ensureHub(engine, hubSlug, project, src.id);
-      if (created) {
-        hubsCreated++;
-        srcHubs++;
+      const existingHub = await findExistingHub(engine, project, src.id);
+      const hubSlug = existingHub ?? `projects/${project}/_index`;
+      if (existingHub) {
+        hubsReused++;
+        srcReused++;
+      } else {
+        const created = await ensureHub(engine, hubSlug, project, src.id);
+        if (created) {
+          hubsCreated++;
+          srcHubs++;
+        }
       }
       // hub → chat: the chat page gains an inbound link and stops being an
       // orphan. ON CONFLICT DO NOTHING makes re-runs cheap and idempotent.
@@ -198,7 +288,9 @@ export async function runPhaseLinkChat(
       chat_orphans: chatOrphans.length,
       linked: srcLinked,
       hubs_created: srcHubs,
+      hubs_reused: srcReused,
       skipped_unparseable: srcSkipped,
+      skipped_ignored: srcIgnored,
       would_link: srcWould,
     };
   }
@@ -217,7 +309,9 @@ export async function runPhaseLinkChat(
       chat_orphans: chatOrphansTotal,
       linked,
       hubs_created: hubsCreated,
+      hubs_reused: hubsReused,
       skipped_unparseable: skippedUnparseable,
+      skipped_ignored: skippedIgnored,
       would_link: wouldLink,
       max_pages_per_tick: cfg.maxPagesPerTick,
       per_source: perSource,
