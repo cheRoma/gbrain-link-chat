@@ -142,7 +142,11 @@ export function hubCandidates(project: string): string[] {
   // Hand-made hubs across EVERY spelling outrank an auto-created `_index` from
   // an earlier run, so a brain that accumulated duplicates converges on the
   // real hub instead of entrenching the split.
-  const canonical = names.flatMap((n) => [`projects/${n}/index`, `projects/${n}`]);
+  const canonical = names.flatMap((n) => [
+    `projects/${n}/index`,
+    `projects/${n}/hub`,
+    `projects/${n}`,
+  ]);
   const autoCreated = names.map((n) => `projects/${n}/_index`);
   return [...canonical, ...autoCreated];
 }

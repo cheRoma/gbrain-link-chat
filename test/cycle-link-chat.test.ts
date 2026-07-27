@@ -199,6 +199,22 @@ describe('runPhaseLinkChat — existing hub reuse', () => {
     expect(backlinks.map((b) => b.from_slug)).toContain('projects/ks2builder/index');
   });
 
+  test('links from an existing projects/<name>/hub page', async () => {
+    await engine.setConfig('cycle.link_chat.enabled', 'true');
+    await seedHub('projects/agent/hub');
+    await seedChat('chat/2026-07-05-agent-1b4e4efe');
+
+    const r = await runPhaseLinkChat(engine, {});
+
+    expect(r.details.hubs_created).toBe(0);
+    expect(await engine.getPage('projects/agent/_index', { sourceId: 'default' })).toBeNull();
+
+    const backlinks = await engine.getBacklinks('chat/2026-07-05-agent-1b4e4efe', {
+      sourceId: 'default',
+    });
+    expect(backlinks.map((b) => b.from_slug)).toContain('projects/agent/hub');
+  });
+
   test('matches an existing hub across underscore/hyphen spelling', async () => {
     await engine.setConfig('cycle.link_chat.enabled', 'true');
     await seedHub('projects/crm-detailing/index');
