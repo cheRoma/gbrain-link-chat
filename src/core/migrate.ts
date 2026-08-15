@@ -5672,6 +5672,128 @@ export const MIGRATIONS: Migration[] = [
         ON session_context_state (updated_at);
     `,
   },
+  {
+    version: 127,
+    name: 'oauth_client_surface_and_minion_queue_index',
+    // WP4 (MCP consumer-feedback wave) — two additive pieces:
+    //
+    // 1. oauth_clients.surface + surface_set_by (amendments 17-19): the
+    //    per-client MCP tool surface consumed by the D2 ceiling resolution in
+    //    serve-http (`min(server --surface ceiling, row surface ?? config
+    //    default)`) and written by `gbrain auth rescope-client --surface`
+    //    (surface_set_by='operator', the lock the request_tools persist
+    //    branch cannot override) and the `request_tools` meta-op
+    //    (surface_set_by='self'). TEXT with an OPEN value space (amendment
+    //    18): unrecognized values are ignored at resolution (warn-once per
+    //    client), and future client tiers will write tier names into this
+    //    same column — never a second column. NULL = no per-client surface
+    //    (server/config resolution applies). verifyAccessToken's degrade
+    //    ladder gained a rung above v85's so pre-v127 brains keep
+    //    authenticating (ENG-9: both columns probed by missingOAuthColumn).
+    //
+    // 2. idx_minion_jobs_queue_status_updated (ENG-10, WP5 wedge index):
+    //    btree (queue, status, updated_at) covering all four count FILTERs
+    //    and both max(updated_at) FILTERs in queryWedgeSignals
+    //    (supervisor.ts) — no non-partial queue index existed before this.
+    //    Plain CREATE INDEX (small table; no CONCURRENTLY needed, which also
+    //    keeps this runnable inside the migration transaction on both
+    //    engines).
+    //
+    // Keep in sync with src/schema.sql, src/core/pglite-schema.ts,
+    // src/core/schema-embedded.ts + the bootstrap probe sets in both engines
+    // (test/schema-bootstrap-coverage.test.ts pins coverage).
+    idempotent: true,
+    sql: `
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface TEXT;
+      ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface_set_by TEXT;
+      CREATE INDEX IF NOT EXISTS idx_minion_jobs_queue_status_updated
+        ON minion_jobs (queue, status, updated_at);
+    `,
+  },
+  {
+    version: 128,
+    name: 'minion_jobs_timeout_backfill_and_duplicate_cycle_cleanup',
+    // Jobs fix wave (upstream issues #2/#3) — two one-shot repairs for rows
+    // that predate the fixes shipping alongside this migration:
+    //
+    // 1. HANDLER_DEFAULT_TIMEOUT_MS backfill. Submit-time stamping (#1737)
+    //    never touched already-queued rows, so their timeout_ms = NULL fell
+    //    to the minutes-scale null-default wall-clock sweep and long handlers
+    //    were dead-lettered mid-progress. Values are SNAPSHOTTED at authoring
+    //    time — deliberately NOT generated from the live map, so every brain
+    //    applies identical SQL under this version number; the claim-time
+    //    COALESCE in MinionQueue.claim owns all future drift. Do NOT sync
+    //    this list when handler-timeouts.ts changes. No timeout_at stamp for
+    //    already-active rows: that would arm the tighter 1x handleTimeouts
+    //    kill mid-flight; the 2x wall-clock bound (via non-NULL timeout_ms)
+    //    is the gentler, sufficient repair, and every future claim stamps
+    //    timeout_at correctly.
+    //
+    // 2. Duplicate autopilot-cycle backlog cleanup. The slot-scoped dispatch
+    //    guards accumulated byte-identical waiting cycles when a job stalled
+    //    in 'active' (unbounded — one observed brain held ~111). Cancel all
+    //    but the newest waiting row per (name, queue, source scope),
+    //    restricted to ticker-keyed rows (idempotency-key prefix heuristic:
+    //    manually submitted cycles carry no key unless the operator passes
+    //    one; mimicking the ticker prefix opts into ticker dedup semantics)
+    //    AND to rows without a camelCase data.sourceId — the ticker only
+    //    ever writes snake_case source_id, so a sourceId row is by
+    //    definition not ticker-provenance and must never be swept
+    //    (adversarial-review tightening: prevents distinct sourceId scopes
+    //    collapsing into the empty source_id group).
+    //    Rows are preserved as 'cancelled' for audit; their idempotency keys
+    //    free naturally via the dead/cancelled key-NULLing rule in add().
+    //    Leaves <=1 waiting (+ possibly 1 active) per scope — converges to
+    //    single-flight within one wall-clock window; the maxPending guard
+    //    (shipped with this wave) prevents new accumulation.
+    //
+    // Non-terminal status set + row-lock race-safety per the v15 precedent
+    // (serializes against claim()'s FOR UPDATE SKIP LOCKED). Idempotent:
+    // statement 1 re-runs match zero rows (timeout_ms IS NULL guard);
+    // statement 2 re-runs keep only survivors.
+    idempotent: true,
+    sql: `
+      UPDATE minion_jobs
+         SET timeout_ms = CASE name
+               WHEN 'subagent'                     THEN 1800000
+               WHEN 'subagent_aggregator'          THEN 1800000
+               WHEN 'embed-backfill'               THEN 1800000
+               WHEN 'autopilot-cycle'              THEN 1800000
+               WHEN 'autopilot-global-maintenance' THEN 1800000
+               WHEN 'chronicle_extract'            THEN 600000
+               WHEN 'facts-absorb'                 THEN 600000
+               WHEN 'contextual_reindex_per_chunk' THEN 3600000
+             END,
+             updated_at = now()
+       WHERE timeout_ms IS NULL
+         AND status IN ('waiting','active','delayed','waiting-children','paused')
+         AND name IN ('subagent','subagent_aggregator','embed-backfill',
+                      'autopilot-cycle','autopilot-global-maintenance',
+                      'chronicle_extract','facts-absorb',
+                      'contextual_reindex_per_chunk');
+
+      UPDATE minion_jobs
+         SET status = 'cancelled',
+             finished_at = now(),
+             updated_at = now(),
+             error_text = 'v128: superseded duplicate autopilot cycle'
+       WHERE status = 'waiting' AND parent_job_id IS NULL
+         AND name IN ('autopilot-cycle','autopilot-global-maintenance')
+         AND (idempotency_key LIKE 'autopilot-cycle:%' OR idempotency_key LIKE 'autopilot-global:%')
+         AND data->>'sourceId' IS NULL
+         AND id NOT IN (
+           SELECT id FROM (
+             SELECT DISTINCT ON (name, queue, COALESCE(data->>'source_id','')) id
+             FROM minion_jobs
+             WHERE status = 'waiting' AND parent_job_id IS NULL
+               AND name IN ('autopilot-cycle','autopilot-global-maintenance')
+               AND (idempotency_key LIKE 'autopilot-cycle:%' OR idempotency_key LIKE 'autopilot-global:%')
+               AND data->>'sourceId' IS NULL
+             ORDER BY name, queue, COALESCE(data->>'source_id',''), created_at DESC, id DESC
+           ) keep
+         );
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

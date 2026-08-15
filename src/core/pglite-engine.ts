@@ -117,14 +117,14 @@ const PGLITE_EDGE_BATCH_MAX_BIND_PARAMS = 30_000;
 // silently fall through to a normal initSchema (snapshot is just an
 // optimization, never authoritative).
 let _snapshotWarnLogged = false;
-function tryLoadSnapshot(snapshotPath: string): Blob | null {
+export function tryLoadSnapshot(snapshotPath: string): Blob | null {
   try {
     // Lazy require so production builds without these imports don't crash.
     // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
-    const crypto = require('node:crypto') as typeof import('node:crypto');
-    const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts');
-    const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts');
+    const fs = require('node:fs') as typeof import('node:fs'); // engine-dynamic-import-ok
+    const crypto = require('node:crypto') as typeof import('node:crypto'); // engine-dynamic-import-ok
+    const { MIGRATIONS } = require('./migrate.ts') as typeof import('./migrate.ts'); // engine-dynamic-import-ok
+    const { PGLITE_SCHEMA_SQL } = require('./pglite-schema.ts') as typeof import('./pglite-schema.ts'); // engine-dynamic-import-ok
 
     if (!fs.existsSync(snapshotPath)) {
       if (!_snapshotWarnLogged) {
@@ -144,7 +144,32 @@ function tryLoadSnapshot(snapshotPath: string): Blob | null {
       return null;
     }
     const expectedHash = computeSnapshotSchemaHash(MIGRATIONS, PGLITE_SCHEMA_SQL, crypto);
-    const actualHash = fs.readFileSync(versionPath, 'utf8').trim();
+    const versionLines = fs.readFileSync(versionPath, 'utf8').trim().split('\n');
+    const actualHash = versionLines[0] ?? '';
+
+    // W0 fix-wave: the version file's dims=/model= lines record the embedding
+    // shape the snapshot was BAKED with. A snapshot whose vector(dims) columns
+    // differ from what THIS process would create poisons every embedding
+    // write ("expected 1280 dimensions, not 1536" — the W0 incident when the
+    // fixture went default-on). Resolve our would-be shape through the same
+    // gateway-with-default fallback initSchema uses and refuse a mismatch.
+    // Version files without the shape lines (pre-W0) are treated as stale.
+    let wantDims: number | string = DEFAULT_EMBEDDING_DIMENSIONS;
+    let wantModel: string = DEFAULT_EMBEDDING_MODEL;
+    try {
+      const gw = require('./ai/gateway.ts') as typeof import('./ai/gateway.ts'); // engine-dynamic-import-ok
+      wantDims = gw.getEmbeddingDimensions();
+      wantModel = gw.getEmbeddingModel();
+    } catch { /* gateway not configured — defaults, same as initSchema */ }
+    const shapeOk = versionLines[1] === `dims=${wantDims}` && versionLines[2] === `model=${wantModel}`;
+    if (!shapeOk) {
+      if (!_snapshotWarnLogged) {
+        // eslint-disable-next-line no-console
+        console.warn(`[pglite] snapshot embedding shape mismatch (want dims=${wantDims} model=${wantModel}, have ${versionLines[1] ?? 'none'} ${versionLines[2] ?? ''}) — using normal init. Rebuild with: bun run build:pglite-snapshot`);
+        _snapshotWarnLogged = true;
+      }
+      return null;
+    }
     if (expectedHash !== actualHash) {
       if (!_snapshotWarnLogged) {
         // eslint-disable-next-line no-console
@@ -162,7 +187,7 @@ function tryLoadSnapshot(snapshotPath: string): Blob | null {
 }
 
 export function computeSnapshotSchemaHash(
-  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string } }>,
+  migrations: Array<{ version: number; name: string; sql?: string; sqlFor?: { pglite?: string }; handler?: unknown }>,
   schemaSQL: string,
   crypto: typeof import('node:crypto'),
 ): string {
@@ -178,6 +203,13 @@ export function computeSnapshotSchemaHash(
     hash.update(m.sql ?? '');
     hash.update('\t');
     hash.update(m.sqlFor?.pglite ?? '');
+    hash.update('\t');
+    // W0 fix-wave (D5.13, Codex #4): 19+ migrations carry executable
+    // `handler` code with empty/absent sql — invisible to the sql-only hash,
+    // so editing a handler reused a stale snapshot. Function.prototype
+    // .toString folds the handler SOURCE into the hash (deterministic within
+    // a checkout; this is a dev/test fixture, not a shipped artifact).
+    hash.update(typeof m.handler === 'function' ? String(m.handler) : '');
     hash.update('\n');
   }
   return hash.digest('hex');
@@ -584,6 +616,18 @@ export class PGLiteEngine implements BrainEngine {
           ...embedded,
         }),
       );
+      // Snapshot-timezone parity: dumpDataDir bakes the BUILD process's
+      // TimeZone into the restored cluster's defaults, so a snapshot-loaded
+      // engine would run sessions in the build machine's zone while a
+      // cold-init engine follows this process (bun test pins TZ=UTC; bun run
+      // follows the host). That divergence shifted every naive-timestamp
+      // day-boundary comparison by the offset — date-dependent tests failed
+      // only in the evening, only under the snapshot. Pin the session to the
+      // RUNTIME zone so restored engines behave exactly like cold ones.
+      if (this._snapshotLoaded && this._db) {
+        const runtimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+        await this._db.query(`SELECT set_config('TimeZone', $1, false)`, [runtimeZone]);
+      }
       // Healthy open: close any repair episode left open by a prior failed
       // attempt (red-team: episodes otherwise stayed open forever — doctor
       // kept reporting corruption-likely and a weeks-stale episode backup
@@ -825,6 +869,10 @@ export class PGLiteEngine implements BrainEngine {
                 WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='source_id') AS oauth_clients_source_id_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='federated_read') AS oauth_clients_federated_read_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='surface') AS oauth_clients_surface_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='oauth_clients' AND column_name='surface_set_by') AS oauth_clients_surface_set_by_exists,
         EXISTS (SELECT 1 FROM information_schema.tables
                 WHERE table_schema='public' AND table_name='sources') AS sources_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
@@ -893,6 +941,8 @@ export class PGLiteEngine implements BrainEngine {
       oauth_clients_exists: boolean;
       oauth_clients_source_id_exists: boolean;
       oauth_clients_federated_read_exists: boolean;
+      oauth_clients_surface_exists: boolean;
+      oauth_clients_surface_set_by_exists: boolean;
       sources_exists: boolean;
       sources_archived_exists: boolean;
       sources_archived_at_exists: boolean;
@@ -946,6 +996,13 @@ export class PGLiteEngine implements BrainEngine {
     // PGLITE_SCHEMA_SQL crash without them.
     const needsOauthClientsBootstrap = probe.oauth_clients_exists
       && (!probe.oauth_clients_source_id_exists || !probe.oauth_clients_federated_read_exists);
+    // WP4 (v127): oauth_clients.surface + surface_set_by. No PGLITE_SCHEMA_SQL
+    // index references them, but the columns are migration-added AND in the
+    // blob's CREATE TABLE — the exact v121 mask class — so the bootstrap adds
+    // them defense-in-depth (and satisfies the MIGRATIONS ADD COLUMN
+    // coverage gate). They ship in one migration and go missing together.
+    const needsOauthClientsSurface = probe.oauth_clients_exists
+      && (!probe.oauth_clients_surface_exists || !probe.oauth_clients_surface_set_by_exists);
     // v0.26.5 (v34): sources.archived + archived_at + archive_expires_at added
     // for soft-delete lifecycle. Not directly referenced by indexes BUT
     // PGLITE_SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS sources` is a no-op on
@@ -1005,6 +1062,7 @@ export class PGLiteEngine implements BrainEngine {
         && !needsMcpLogBootstrap && !needsSubagentProviderId
         && !needsPagesRecency && !needsIngestLogSourceId
         && !needsFilesBootstrap && !needsOauthClientsBootstrap
+        && !needsOauthClientsSurface
         && !needsSourcesArchive && !needsPagesLastRetrievedAt
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
@@ -1172,6 +1230,18 @@ export class PGLiteEngine implements BrainEngine {
           DEFAULT 'default' REFERENCES sources(id) ON DELETE SET NULL;
         ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS federated_read TEXT[]
           NOT NULL DEFAULT '{}';
+      `);
+    }
+
+    if (needsOauthClientsSurface) {
+      // WP4 (v127): per-client MCP tool surface + operator-lock marker.
+      // Nullable TEXT, no index — bootstrap mirrors the v127 column shape so
+      // the blob's CREATE TABLE presence can't mask the forward reference on
+      // pre-v127 brains (the v121 wedge class). v127 runs later via
+      // runMigrations and is idempotent.
+      await this.db.exec(`
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface TEXT;
+        ALTER TABLE oauth_clients ADD COLUMN IF NOT EXISTS surface_set_by TEXT;
       `);
     }
 
