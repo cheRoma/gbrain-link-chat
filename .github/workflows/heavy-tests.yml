@@ -192,10 +192,18 @@ jobs:
   # auth hermes fails this job rather than skipping.
   hermes-door:
     name: Hermes door e2e (real binary, loud-fail)
+    # Gated OFF in this repo: the door drives a LIVE model turn and dies at
+    # its precondition step with "ANTHROPIC_API_KEY secret is empty". This
+    # repo holds no Actions secrets at all, so the job has never been able to
+    # pass here — it only turned the nightly red and drowned the signal from
+    # the `heavy` job. Set the repo variable GBRAIN_RUN_SECRET_DOORS=true
+    # (plus the ANTHROPIC_API_KEY secret) to turn it back on.
     if: |
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
-      contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      vars.GBRAIN_RUN_SECRET_DOORS == 'true' && (
+        github.event_name != 'pull_request' ||
+        contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
+        contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubuntu-latest
     # Four serial door tests at 600s each plus the installer budget cannot
     # fit the sibling job's 20 minutes.
@@ -693,8 +701,14 @@ jobs:
           tail -40 claude-plugin-door.txt
           if [ "$EXIT" -ne 0 ]; then exit "$EXIT"; fi
           pass_count=$(grep -Eo '[0-9]+ pass' claude-plugin-door.txt | tail -1 | grep -Eo '^[0-9]+' || true)
-          if [ "${pass_count:-0}" -ne 1 ]; then
-            echo "::error::claude plugin door expected exactly 1 passing INSTALL test, summary shows '${pass_count:-none}' — refusing to go green (re-pin deliberately when tests are added)" >&2
+          # Re-pinned 1 -> 2 on 2026-08-18: v0.46.18.0 added the second
+          # INSTALL test ("persona variant gbrain-coding installs from the
+          # same marketplace") to claude-plugin-install-real without moving
+          # this count, so the suite went 2 pass / 1 skip / 0 fail and the
+          # guard refused it. Deliberate re-pin, exactly as the message below
+          # instructs — the tests themselves are green.
+          if [ "${pass_count:-0}" -ne 2 ]; then
+            echo "::error::claude plugin door expected exactly 2 passing INSTALL tests, summary shows '${pass_count:-none}' — refusing to go green (re-pin deliberately when tests are added)" >&2
             exit 1
           fi
 
@@ -716,10 +730,15 @@ jobs:
   # non-PR arm, so an input would be dead yaml.
   opencode-door:
     name: opencode door e2e (real binary, keyless SMOKE)
+    # Gated OFF in this repo for the same reason as hermes-door: it fails at
+    # "Preconditions (secret present)" because this repo carries no Actions
+    # secrets. Re-enable with the repo variable GBRAIN_RUN_SECRET_DOORS=true.
     if: |
-      github.event_name != 'pull_request' ||
-      contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
-      contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      vars.GBRAIN_RUN_SECRET_DOORS == 'true' && (
+        github.event_name != 'pull_request' ||
+        contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
+        contains(github.event.pull_request.labels.*.name, 'heavy-tests')
+      )
     runs-on: ubuntu-latest
     # Measured local door wall-time: full 6-test run 35.8s + one-time
     # compiled gbrain build (~2-4 min) + npm install (~15s); free-tier +
