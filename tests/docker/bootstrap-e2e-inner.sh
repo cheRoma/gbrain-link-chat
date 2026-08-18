@@ -250,6 +250,18 @@ grep -Fq "serve --surface full" "$GB_CODEX_STATE" || fail "codex registration di
 # shape (absolute binary, GBRAIN_SOURCE bound, full surface), and no Claude
 # hooks written.
 step "opencode MCP registration (direct JSONC writer, no binary)"
+# LOCAL DELTA vs upstream — drop this block when garrytan/gbrain#4293 lands.
+# The assertion below wants the no-answer-recorded default, but run_interview
+# recorded MCP_SCOPE=project for the codex lane back at line 176, and opencode
+# (unlike codex, which has no scope flag) honors it — so the step registered
+# with "scope: project (explicit opt-in)" and the assertion failed. Restore the
+# precondition the step actually documents. --skip voids the prior confirmation
+# by design, hence the re-confirm; verified against the real CLI, and this is
+# the last step in the script, so nothing downstream depends on either.
+gbrain bootstrap interview --skip MCP_SCOPE --workspace "$WS" > /dev/null
+oc_hash="$(gbrain bootstrap interview --status --workspace "$WS" | sed -n 's/.*read-back hash: \([0-9a-f][0-9a-f]*\).*/\1/p')"
+[ -n "$oc_hash" ] || fail "no read-back hash after skipping MCP_SCOPE"
+gbrain bootstrap interview --confirm "$oc_hash" --workspace "$WS" > /dev/null
 export XDG_CONFIG_HOME="$SCRATCH/xdg-config"
 opencode_out="$(gbrain bootstrap hooks --workspace "$WS" --harness opencode --gbrain-bin "$FAKE_GBRAIN" 2>&1)"
 printf '%s\n' "$opencode_out"
