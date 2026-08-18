@@ -4,15 +4,23 @@
  */
 
 import type { BrainEngine } from '../core/engine.ts';
-import { MinionQueue } from '../core/minions/queue.ts';
+// Leaf module (no flag surface of its own) — see that file for why this
+// isn't imported from extract-conversation-facts.ts directly (#4135).
+import { ALLOWED_TYPES, type AllowedType } from '../core/facts/conversation-types.ts';
+import { MinionQueue, deriveWedgeSignal } from '../core/minions/queue.ts';
 import { MinionWorker } from '../core/minions/worker.ts';
-import { WORKER_EXIT_RSS_WATCHDOG } from '../core/minions/worker-exit-codes.ts';
+import {
+  WORKER_EXIT_RSS_WATCHDOG,
+  JOB_CHILD_EXIT_USAGE,
+} from '../core/minions/worker-exit-codes.ts';
+import { CHILD_ENV, resolveChildCliInvocation } from '../core/minions/job-isolation.ts';
+import { runChildJobEntry } from '../core/minions/run-child.ts';
 import type { MinionHandler, MinionJob, MinionJobStatus } from '../core/minions/types.ts';
 import type { PaceKeyOverrides } from '../core/pace-mode.ts';
 import { loadConfig, isThinClient } from '../core/config.ts';
 import { callRemoteTool, unpackToolResult } from '../core/mcp-client.ts';
 import { parseNiceValue, applyNiceness, getEffectiveNiceness, formatNice } from '../core/minions/niceness.ts';
-import { defaultTimeoutMsFor } from '../core/minions/handler-timeouts.ts';
+import { defaultTimeoutMsFor, defaultLockDurationMsFor, clampLockDurationMs } from '../core/minions/handler-timeouts.ts';
 
 function parseFlag(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -154,6 +162,32 @@ export function resolveWorkerConcurrency(args: string[], env: NodeJS.ProcessEnv 
   return parsed;
 }
 
+export type JobIsolationMode = 'inline' | 'process';
+
+/**
+ * issue #5: `--job-isolation <inline|process>` (space or `=` form), env
+ * fallback GBRAIN_JOB_ISOLATION, default inline. `process` runs each claimed
+ * job in a SIGKILL-able child process — blast radius 1 job instead of N.
+ * Env injected as a param so tests never mutate process.env (rule R1).
+ * Invalid values fail fast (parseMaxRssFlag convention).
+ */
+export function parseJobIsolationFlag(
+  args: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): JobIsolationMode {
+  let raw: string | undefined;
+  const eqForm = args.find((a) => a.startsWith('--job-isolation='));
+  if (eqForm !== undefined) raw = eqForm.slice('--job-isolation='.length);
+  if (raw === undefined) raw = parseFlag(args, '--job-isolation');
+  if (raw === undefined || raw === '') raw = env.GBRAIN_JOB_ISOLATION;
+  if (raw === undefined || raw === '') return 'inline';
+  if (raw === 'inline' || raw === 'process') return raw;
+  console.error(
+    `Error: invalid job isolation mode ${JSON.stringify(raw)}. Valid: inline, process.`,
+  );
+  process.exit(1);
+}
+
 /**
  * #3026: the thin-client `list`/`get` branches receive jobs as parsed JSON
  * off the MCP wire, where every timestamp is an ISO string — but formatJob /
@@ -211,7 +245,17 @@ function formatTimeoutLines(job: MinionJob): string[] {
     if (d != null) {
       lines.push(`  Timeout: (unset) — handler default ${d}ms stamps at claim`);
     } else {
-      lines.push(`  Timeout: (unset) — null-default wall-clock sweep applies (2 x lock-duration x max_stalled, ~5m at defaults)`);
+      lines.push(`  Timeout: (unset) — null-default wall-clock sweep applies (2 x lock lease x max_stalled, ~5m at 30s-lease defaults)`);
+    }
+  }
+  // #4145: the lock lease line mirrors the timeout line — row value when
+  // stamped, otherwise the handler-map default that WILL stamp at claim.
+  if (job.lock_duration_ms != null) {
+    lines.push(`  Lock lease: ${job.lock_duration_ms}ms (renewed at min(lease/2, 60s) cadence)`);
+  } else {
+    const lease = defaultLockDurationMsFor(job.name);
+    if (lease != null) {
+      lines.push(`  Lock lease: (unset) — handler default ${lease}ms stamps at claim`);
     }
   }
   return lines;
@@ -255,6 +299,7 @@ USAGE
                             [--max-waiting N]
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
+                            [--lock-duration-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
                             [--redact-secrets]   (shell only; scrubs inherit
                                                   values from stdout/stderr)
@@ -269,11 +314,13 @@ USAGE
   gbrain jobs watch [--json] [--follow] [--refresh-ms=N]
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
+                   [--job-isolation inline|process]
   gbrain jobs supervisor [start] [--detach] [--json]
                          [--concurrency N] [--queue Q] [--pid-file PATH]
                          [--max-crashes N] [--health-interval N]
                          [--allow-shell-jobs] [--cli-path PATH]
                          [--max-rss MB] [--nice N]
+                         [--job-isolation inline|process]
 
     --nice N   OS scheduling priority, -20 (highest) to 19 (nicest). Lowers CPU
                priority without cutting concurrency — full throughput when the
@@ -344,9 +391,18 @@ const JOBS_SUBCOMMAND_HELP: Record<string, string> = {
 USAGE
   gbrain jobs work [--queue Q] [--concurrency N] [--max-rss MB]
                    [--health-interval MS] [--nice N]
+                   [--job-isolation inline|process]
 
 OPTIONS
   --queue Q            Queue to claim from (default: default)
+  --job-isolation M    inline (default): handlers run in the worker process.
+                       process: each claimed job runs in its own child
+                       process — a stuck handler is group-SIGKILLed instead
+                       of abandoned, and a crash takes one job, not all N.
+                       Env fallback: GBRAIN_JOB_ISOLATION. Recommended for
+                       long-running LLM-bound handlers (subagent). Note:
+                       --max-rss then covers the worker only, and each child
+                       adds ~4 pooler client connections.
   --concurrency N      Max jobs in flight. Resolution: flag, then
                        GBRAIN_WORKER_CONCURRENCY env, then 1. Values < 1
                        are clamped to 1 with a loud stderr note.
@@ -376,6 +432,7 @@ USAGE
                          [--max-crashes N] [--health-interval N]
                          [--allow-shell-jobs] [--cli-path PATH]
                          [--max-rss MB] [--nice N]
+                         [--job-isolation inline|process]
   gbrain jobs supervisor status [--json] [--pid-file PATH]
   gbrain jobs supervisor stop [--json] [--pid-file PATH]
 
@@ -397,6 +454,7 @@ OPTIONS (start)
   --cli-path PATH      Explicit gbrain binary for the worker child
   --max-rss MB         RSS watchdog for the worker (same rules as jobs work)
   --nice N             OS priority for supervisor + worker children
+  --job-isolation M    Passed through to the worker (see jobs work --help)
 
 EXIT CODES (start)
   0 clean shutdown   1 max crashes exceeded
@@ -411,6 +469,7 @@ USAGE
                             [--max-waiting N]
                             [--backoff-type fixed|exponential] [--backoff-delay Nms]
                             [--backoff-jitter 0..1] [--timeout-ms Nms]
+                            [--lock-duration-ms Nms]
                             [--idempotency-key K] [--queue Q] [--dry-run]
                             [--redact-secrets]
 
@@ -427,6 +486,10 @@ OPTIONS
                        source before coalescing new submissions ([1,100])
   --timeout-ms Nms     Per-job wall-clock budget. Long-lane handlers get a
                        default from HANDLER_DEFAULT_TIMEOUT_MS when omitted.
+  --lock-duration-ms N Per-job lock lease (#4145). Clamped to [5s, 1h].
+                       Long-lane handlers default to 300s via
+                       HANDLER_DEFAULT_LOCK_DURATION_MS; others use the
+                       worker default (30s).
   --idempotency-key K  At-most-one row per key (dead/cancelled free the key)
   --queue Q            Target queue (default: default)
   --dry-run            Print what would be submitted, submit nothing
@@ -536,6 +599,15 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         console.error('Error: --timeout-ms must be a positive integer (milliseconds)');
         process.exit(1);
       }
+      // #4145: per-job lock lease. Clamped to [5s,1h] in queue.add via
+      // clampLockDurationMs (shared with the MCP op); NULL falls to the
+      // handler map, then the worker default.
+      const lockDurationMsRaw = parseFlag(args, '--lock-duration-ms');
+      const lockDurationMs = lockDurationMsRaw !== undefined ? parseInt(lockDurationMsRaw, 10) : undefined;
+      if (lockDurationMsRaw !== undefined && (isNaN(lockDurationMs!) || lockDurationMs! <= 0)) {
+        console.error('Error: --lock-duration-ms must be a positive integer (milliseconds)');
+        process.exit(1);
+      }
       const idempotencyKey = parseFlag(args, '--idempotency-key');
       const queueName = parseFlag(args, '--queue') ?? 'default';
       const dryRun = hasFlag(args, '--dry-run');
@@ -559,6 +631,12 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         if (backoffDelay !== undefined) console.log(`  Backoff delay: ${backoffDelay}ms`);
         if (backoffJitter !== undefined) console.log(`  Backoff jitter: ${backoffJitter}`);
         if (timeoutMs !== undefined) console.log(`  Timeout: ${timeoutMs}ms`);
+        if (lockDurationMs !== undefined) {
+          // Echo what will actually be STORED (queue.add clamps to [5s,1h]);
+          // a dry-run that prints the raw out-of-range input lies.
+          const stored = clampLockDurationMs(lockDurationMs);
+          console.log(`  Lock lease: ${stored}ms${stored !== lockDurationMs ? ` (clamped from ${lockDurationMs}ms)` : ''}`);
+        }
         if (idempotencyKey) console.log(`  Idempotency key: ${idempotencyKey}`);
         if (delay > 0) console.log(`  Delay: ${delay}ms`);
         console.log(`  Data: ${JSON.stringify(data)}`);
@@ -604,6 +682,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         backoff_delay: backoffDelay,
         backoff_jitter: backoffJitter,
         timeout_ms: timeoutMs,
+        lock_duration_ms: lockDurationMs,
         idempotency_key: idempotencyKey,
         queue: queueName,
       }, trusted);
@@ -843,17 +922,100 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       const statsQueue = parseFlag(args, '--queue') ?? 'default';
       const stats = await queue.getStats({ queue: statsQueue });
 
+      // Divergence detection: intake (created in window) vs USEFUL drain
+      // (drained_completed — cancellations are outflow, not work; a naive
+      // combined drain self-inflates while the TTL sweep shreds backlog).
+      // Same env-threshold pattern as the wedge line below.
+      const divergenceRatio = (() => {
+        const raw = Number(process.env.GBRAIN_QUEUE_DIVERGENCE_RATIO ?? '');
+        return Number.isFinite(raw) && raw > 0 ? raw : 2;
+      })();
+      const divergenceMinWaiting = (() => {
+        const raw = parseInt(process.env.GBRAIN_QUEUE_DIVERGENCE_MIN_WAITING ?? '', 10);
+        return Number.isFinite(raw) && raw > 0 ? raw : 50;
+      })();
+      const divergent = stats.by_type.filter(t =>
+        t.waiting_now > divergenceMinWaiting &&
+        t.total > divergenceRatio * Math.max(t.drained_completed, 1));
+
+      // Waiting-TTL cancellations in the window (admission sweep visibility —
+      // derived from the reason prefix cancelJobs writes; no extra storage).
+      let ttlCancelled: Array<{ name: string; count: number }> = [];
+      try {
+        const { TTL_REASON_PREFIX } = await import('../core/minions/admission.ts');
+        const ttlRows = await engine.executeRaw<{ name: string; count: string }>(
+          `SELECT name, count(*)::text AS count FROM minion_jobs
+            WHERE status = 'cancelled' AND error_text LIKE $1
+              AND finished_at > now() - interval '24 hours'
+            GROUP BY name ORDER BY count(*) DESC`,
+          [`${TTL_REASON_PREFIX}%`],
+        );
+        ttlCancelled = ttlRows.map(r => ({ name: r.name, count: parseInt(r.count, 10) }));
+      } catch { /* best-effort */ }
+      // Job names originate from the MCP-exposed submit surface — strip
+      // control/ANSI bytes + cap before echoing into the terminal screams
+      // (same hygiene as frontmatter-derived type names). Names embedded in
+      // COPY-PASTEABLE command hints get the stricter safeConfigSegment gate:
+      // display-sanitize keeps shell metacharacters.
+      const { sanitizeTypeForDisplay: sanitizeName } = await import('../core/schema-pack/type-usage.ts');
+      const { safeConfigSegment } = await import('../core/minions/admission.ts');
+
+      if (hasFlag(args, '--json')) {
+        console.log(JSON.stringify({
+          queue: statsQueue,
+          ...stats,
+          divergent: divergent.map(t => ({
+            name: t.name,
+            intake_24h: t.total,
+            drained_completed_24h: t.drained_completed,
+            waiting_now: t.waiting_now,
+            oldest_waiting_minutes: t.oldest_waiting_minutes,
+          })),
+          ttl_cancelled_24h: ttlCancelled,
+        }, null, 2));
+        break;
+      }
+
       console.log('Job Stats (last 24h):');
       if (stats.by_type.length > 0) {
-        console.log(`  ${'Type'.padEnd(14)} ${'Total'.padEnd(7)} ${'Done'.padEnd(7)} ${'Failed'.padEnd(8)} ${'Dead'.padEnd(6)} Avg Time`);
+        console.log(`  ${'Type'.padEnd(14)} ${'Total'.padEnd(7)} ${'Done'.padEnd(7)} ${'Failed'.padEnd(8)} ${'Dead'.padEnd(6)} ${'Drained'.padEnd(9)} ${'Waiting'.padEnd(9)} Avg Time`);
         for (const t of stats.by_type) {
           const avgTime = t.avg_duration_ms != null ? `${(t.avg_duration_ms / 1000).toFixed(1)}s` : '—';
-          console.log(`  ${t.name.padEnd(14)} ${String(t.total).padEnd(7)} ${String(t.completed).padEnd(7)} ${String(t.failed).padEnd(8)} ${String(t.dead).padEnd(6)} ${avgTime}`);
+          // Drained = terminal outflow in-window, completed-first with the
+          // rest bracketed so TTL-cancel storms can't masquerade as work.
+          const drained = `${t.drained_completed}${(t.drained_failed + t.drained_dead + t.drained_cancelled) > 0 ? `(+${t.drained_failed + t.drained_dead + t.drained_cancelled})` : ''}`;
+          console.log(`  ${sanitizeName(t.name).padEnd(14)} ${String(t.total).padEnd(7)} ${String(t.completed).padEnd(7)} ${String(t.failed).padEnd(8)} ${String(t.dead).padEnd(6)} ${drained.padEnd(9)} ${String(t.waiting_now).padEnd(9)} ${avgTime}`);
         }
+        console.log(`  (Drained = completed in-window, +N = failed/dead/cancelled outflow; Waiting = now, all queues)`);
       } else {
         console.log('  No jobs in the last 24 hours.');
       }
       console.log(`\n  Queue health: ${stats.queue_health.waiting} waiting, ${stats.queue_health.active} active, ${stats.queue_health.stalled} stalled`);
+
+      // DIVERGENT-queue scream: intake structurally exceeds useful drain and a
+      // real backlog is sitting there. This is the default-on protection layer
+      // (quota ships config-only), so it must carry the opt-in hint.
+      for (const t of divergent) {
+        const perDay = t.drained_completed; // window is 24h
+        const etaDays = perDay > 0 ? Math.round(t.waiting_now / perDay) : null;
+        const eta = etaDays != null ? `~${etaDays}d backlog at current drain` : 'backlog never drains at current rate';
+        const ttl = ttlCancelled.find(c => c.name === t.name);
+        const ttlNote = ttl ? ` Waiting-TTL is cancelling ~${ttl.count}/day of it.` : '';
+        console.log(
+          `\n  ⚠  DIVERGENT QUEUE type '${sanitizeName(t.name)}': intake ${t.total}/24h vs ${t.drained_completed} completed/24h, ` +
+          `${t.waiting_now} waiting (${eta}).${ttlNote}\n` +
+          `     Reduce intake, raise drain, or cap admission:\n` +
+          `       gbrain config set minions.quota_max_waiting.${safeConfigSegment(t.name) ?? '<job-name>'} <n>`,
+        );
+      }
+      if (ttlCancelled.length > 0) {
+        const parts = ttlCancelled.map(c => `${sanitizeName(c.name)}: ${c.count}`).join(', ');
+        console.log(
+          `\n  ⚠  Waiting-TTL cancelled ${ttlCancelled.reduce((a, c) => a + c.count, 0)} job(s) in the last 24h (${parts}).\n` +
+          `     These waited past their TTL without ever being claimed. Tune:\n` +
+          `       gbrain config set minions.ttl_waiting_hours.<name> <hours|0>`,
+        );
+      }
 
       // Scheduling priority (niceness, issue #1815). Best-effort: measures live
       // workers from the registry + the supervisor (if running) — silently skips
@@ -885,13 +1047,9 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       {
         const w = stats.wedge;
         const mins = w.minutes_since_completion;
-        // Same threshold the doctor `wedged_queue` check uses, so the two
-        // advisory surfaces agree (issue #1801).
-        const wedgeMins = (() => {
-          const raw = parseInt(process.env.GBRAIN_WEDGED_QUEUE_WARN_MINUTES ?? '', 10);
-          return Number.isFinite(raw) && raw > 0 ? raw : 15;
-        })();
-        const wedged = w.active_healthy === 0 && w.waiting > 0 && (mins === null || mins > wedgeMins);
+        // Shared derivation (queue.ts deriveWedgeSignal) so this line, the
+        // doctor wedged_queue check, and the get_job_stats op agree (#1801).
+        const { wedged, wedge_threshold_minutes: wedgeMins } = deriveWedgeSignal(w);
         if (wedged) {
           const since = mins === null ? 'no completions on record' : `${mins}m since last completion`;
           console.log(
@@ -1185,6 +1343,59 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       process.exit(0);
     }
 
+    case 'run-child': {
+      // INTERNAL (issue #5 process isolation): spawned by `jobs work` with
+      // process isolation enabled. One job, one process: validate the claim,
+      // run the handler with the child's own engine, write ONE outcome file,
+      // exit. Deliberately absent from user-facing help. The CLI layer owns
+      // engine.disconnect() + process.exit() (engine-ownership invariant).
+      {
+        const config = loadConfig();
+        if (config?.engine === 'pglite') {
+          console.error('[run-child] process isolation requires the Postgres engine.');
+          await engine.disconnect();
+          process.exit(JOB_CHILD_EXIT_USAGE);
+        }
+        const jobIdRaw = parseFlag(args, '--job-id');
+        const jobId = jobIdRaw != null ? parseInt(jobIdRaw, 10) : NaN;
+        const lockToken = process.env[CHILD_ENV.lockToken];
+        const resultPath = process.env[CHILD_ENV.resultPath];
+        const parentPidRaw = parseInt(process.env[CHILD_ENV.parentPid] ?? '0', 10);
+        if (!Number.isInteger(jobId) || jobId <= 0 || !lockToken || !resultPath) {
+          console.error(
+            '[run-child] internal command spawned by the jobs worker; requires ' +
+            `a numeric job id plus ${CHILD_ENV.lockToken} and ${CHILD_ENV.resultPath} in env.`,
+          );
+          await engine.disconnect();
+          process.exit(JOB_CHILD_EXIT_USAGE);
+        }
+
+        // Same handler surface as the worker: registerBuiltinHandlers also
+        // performs plugin discovery, so plugin subagent jobs isolate too.
+        const throwaway = new MinionWorker(engine, { queue: 'default', concurrency: 1 });
+        await registerBuiltinHandlers(throwaway, engine, { quiet: true });
+
+        let code: number;
+        try {
+          code = await runChildJobEntry(
+            engine,
+            {
+              jobId,
+              lockToken,
+              resultPath,
+              parentPid: Number.isInteger(parentPidRaw) && parentPidRaw > 0 ? parentPidRaw : 0,
+            },
+            { resolveHandler: (name) => throwaway.getHandler(name) },
+          );
+        } catch (e) {
+          console.error(`[run-child] fatal: ${e instanceof Error ? e.message : String(e)}`);
+          code = 1;
+        }
+        await engine.disconnect();
+        process.exit(code);
+      }
+    }
+    // eslint-disable-next-line no-fallthrough -- unreachable: the case above always exits
     case 'work': {
       // Check if PGLite
       const config = (await import('../core/config.ts')).loadConfig();
@@ -1245,11 +1456,78 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         }
       }
 
+      // issue #5: per-job process isolation. Resolve + validate the child CLI
+      // invocation ONCE at startup and refuse to start on failure — a bad
+      // path discovered per-job would release every claim as infra failures
+      // (never dead-lettering, but never progressing either).
+      const jobIsolation = parseJobIsolationFlag(args);
+      let childCliInvocation: { cmd: string; argsPrefix: string[] } | null = null;
+      let childTiniPath = '';
+      if (jobIsolation === 'process') {
+        const { resolveGbrainCliPath } = await import('./autopilot.ts');
+        const inv = resolveChildCliInvocation(
+          process.env,
+          process.execPath,
+          process.argv[1],
+          () => resolveGbrainCliPath(),
+        );
+        if (!inv) {
+          console.error(
+            'Error: process isolation needs a resolvable gbrain CLI for job children ' +
+            '(compiled binary on PATH, or GBRAIN_JOB_CHILD_CLI override).',
+          );
+          process.exit(1);
+        }
+        // Canonicalize BEFORE validating: existsSync on a relative name checks
+        // cwd while spawn() resolves via PATH — the validated file and the
+        // executed binary could differ (security review). Resolving to an
+        // absolute path makes the fail-fast check and the spawn agree.
+        const { existsSync: childCliExists } = await import('node:fs');
+        const { resolve: resolveCliPath } = await import('node:path');
+        inv.cmd = resolveCliPath(inv.cmd);
+        if (!childCliExists(inv.cmd)) {
+          console.error(
+            `Error: resolved child CLI does not exist: ${inv.cmd} ` +
+            '(set GBRAIN_JOB_CHILD_CLI to a valid gbrain binary).',
+          );
+          process.exit(1);
+        }
+        childCliInvocation = inv;
+        const { detectTini } = await import('../core/minions/spawn-helpers.ts');
+        childTiniPath = detectTini();
+        if (maxRssMb > 0) {
+          console.error(
+            '[gbrain jobs] note: with process isolation on, the --max-rss watchdog covers the ' +
+            'WORKER process only — handler memory now lives in job children. Per-child caps are ' +
+            'a filed follow-up; size host memory for concurrency x handler footprint.',
+          );
+        }
+      }
+
       try { await queue.ensureSchema(); }
       catch (e) { console.error(e instanceof Error ? e.message : String(e)); process.exit(1); }
 
+      // issue #6: the direct-pool kill switch collapses lock renewal, health
+      // probes, and handler workload onto ONE shared pool — silently. Make
+      // the collapse loud at startup so a later 'pool_starved' incident has
+      // an obvious prior warning instead of a mystery.
+      {
+        const { getConnectionRouting } = await import('../core/minions/db-probe.ts');
+        const cm = getConnectionRouting(engine);
+        if (cm?.isDualPoolActive && !cm.isDualPoolActive()) {
+          const killSwitched = cm.describeMode?.().kill_switch_active === true;
+          console.error(
+            `[gbrain jobs] single-pool mode: lock renewal, health probes and handler workload share ` +
+            `one connection pool${killSwitched ? ' (direct-lane kill switch is active)' : ''}. ` +
+            `Under heavy handler load this pool can starve the lock heartbeat. For Supabase brains, ` +
+            `ensure the direct (5432) host is reachable or set GBRAIN_DIRECT_DATABASE_URL.`,
+          );
+        }
+      }
+
       const worker = new MinionWorker(engine, {
         queue: queueName, concurrency, maxRssMb, healthCheckInterval,
+        jobIsolation, childCliInvocation, childTiniPath,
       });
       await registerBuiltinHandlers(worker, engine);
 
@@ -1259,9 +1537,37 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
       // the external PM (systemd, Docker, cron watchdog) restart cleanly.
       worker.on('unhealthy', (info) => {
         if (info.reason === 'db_dead') {
+          // issue #6: name the failing LAYER, not just "DB unreachable" —
+          // that message sent operators chasing database capacity while the
+          // real fault was client-side pool exhaustion. Exiting is still
+          // correct recovery either way (it frees every client-held slot).
+          if (info.verdict === 'pool_starved') {
+            console.error(
+              `[health] FATAL: connection-pool path saturated after ${info.consecutiveFailures} probes — ` +
+              `the database server itself is reachable. (${info.message}) ` +
+              `Likely causes: long-running handler queries holding pool slots, or too-small GBRAIN_POOL_SIZE ` +
+              `for this workload. Consider --job-isolation process for long-running handlers ` +
+              `(handler connections then die with each job's child process). ` +
+              `Exiting for process-manager restart (frees all client-held slots).`,
+            );
+          } else if (info.verdict === 'server_unreachable') {
+            console.error(
+              `[health] FATAL: database server unreachable after ${info.consecutiveFailures} probes ` +
+              `(both pooler and direct lanes failed). (${info.message}) ` +
+              `Exiting for process-manager restart.`,
+            );
+          } else {
+            console.error(
+              `[health] FATAL: DB probe failed ${info.consecutiveFailures} consecutive times (${info.message}). ` +
+              `Exiting for process-manager restart.`,
+            );
+          }
+        } else if (info.reason === 'child_spawn_failing') {
           console.error(
-            `[health] FATAL: DB unreachable after ${info.consecutiveFailures} probes (${info.message}). ` +
-            `Exiting for process-manager restart.`,
+            `[health] FATAL: ${info.consecutiveFailures} consecutive job-child spawn/bootstrap ` +
+            `failures (${info.message}). The child CLI is deterministically broken — fix the ` +
+            `worker's child CLI configuration (or GBRAIN_JOB_CHILD_CLI). Exiting for ` +
+            `process-manager restart.`,
           );
         } else {
           console.error(
@@ -1290,7 +1596,10 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
             : `, health-check: ${Math.round(healthCheckInterval / 1000)}s`)
         : '';
       const niceNote = niceResult ? `, nice: ${formatNice(niceResult.effective ?? niceVal!)}` : '';
-      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote})`);
+      const isolationNote = jobIsolation === 'process'
+        ? `, isolation: process (child cli: ${childCliInvocation?.cmd}${childTiniPath ? ', tini' : ''})`
+        : '';
+      console.log(`Minion worker started (queue: ${queueName}, concurrency: ${concurrency}${watchdogNote}${healthNote}${niceNote}${isolationNote})`);
       console.log(`Registered handlers: ${worker.registeredNames.join(', ')}`);
 
       // Register in the live worker registry (issue #1815) so jobs stats / doctor
@@ -1609,6 +1918,7 @@ export async function runJobs(engineOrNull: BrainEngine | null, args: string[]):
         allowShellJobs,
         json: jsonMode,
         maxRssMb,
+        jobIsolation: parseJobIsolationFlag(args),
         ...(supNice !== undefined ? { nice_requested: supNice } : {}),
         ...(supNiceResult?.effective != null ? { nice_effective: supNiceResult.effective } : {}),
         ...(supNiceResult?.error ? { nice_error: supNiceResult.error } : {}),
@@ -1783,6 +2093,15 @@ export async function registerBuiltinHandlers(
       // invocation whose whole point was to do neither.
       dryRun: !!job.data.dryRun,
       sourceId: typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined,
+      // Background parity (D7): the doc-recommended recovery
+      // `embed --stale --catch-up --include-null-signature --background`
+      // used to silently DEGRADE — the payload dropped these four, so the
+      // job ran as a plain 30-min-budget stale pass with the grandfather
+      // clause intact. Serialize + read them like every other embed knob.
+      catchUp: !!job.data.catchUp,
+      includeNullSignature: !!job.data.includeNullSignature,
+      batchSize: typeof job.data.batchSize === 'number' ? job.data.batchSize : undefined,
+      priority: job.data.priority === 'recent' ? 'recent' : undefined,
       // CX1+CX5: pace overrides ride in the job payload as explicit overrides
       // only; runEmbedCore re-resolves env > config > bundle at execution so
       // GBRAIN_PACE_* still wins during an incident.
@@ -1836,14 +2155,16 @@ export async function registerBuiltinHandlers(
       // SHOULD pin to one source per call (job_id is per-call).
       throw new Error('extract-conversation-facts Minion job requires data.sourceId');
     }
+    // ALLOWED_TYPES is the single source of truth for the conversation-facts
+    // type allowlist (see src/core/facts/conversation-types.ts).
     const types = Array.isArray(job.data.types)
-      ? (job.data.types as string[]).filter((t) =>
-          ['conversation', 'meeting', 'slack', 'email', 'imessage', 'imessage-daily'].includes(t),
+      ? (job.data.types as string[]).filter(
+          (t): t is AllowedType => (ALLOWED_TYPES as readonly string[]).includes(t),
         )
       : undefined;
     const result = await runExtractConversationFactsCore(engine, {
       sourceId,
-      types: types as ('conversation' | 'meeting' | 'slack' | 'email')[] | undefined,
+      types,
       slug: typeof job.data.slug === 'string' ? job.data.slug : undefined,
       dryRun: !!job.data.dryRun,
       limit: typeof job.data.limit === 'number' ? job.data.limit : undefined,
@@ -2337,14 +2658,17 @@ export async function registerBuiltinHandlers(
       const result = await engine.purgeDeletedPages(olderThanHours);
       pagesPurged = result.count;
     }
+    let sourcesBlocked: Array<{ id: string; reason: string }> = [];
     if (scope === 'sources' || scope === 'all') {
       const { purgeExpiredSources } = await import('../core/destructive-guard.ts');
-      sourcesPurged = await purgeExpiredSources(engine);
+      const purgeResult = await purgeExpiredSources(engine);
+      sourcesPurged = purgeResult.purged;
+      sourcesBlocked = purgeResult.blocked;
     }
     // GC stale op_checkpoints rows (folded scope item +C from review).
     const { purgeStaleCheckpoints } = await import('../core/op-checkpoint.ts');
     const checkpointsPurged = await purgeStaleCheckpoints(engine, 7);
-    return { pagesPurged, sourcesPurged, checkpointsPurged, dryRun };
+    return { pagesPurged, sourcesPurged, sourcesBlocked, checkpointsPurged, dryRun };
   });
 
   // Phase-wrapper handlers — each delegates to runCycle({ phases: [name] }).
@@ -2483,6 +2807,7 @@ export async function registerBuiltinHandlers(
       sourceId?: string;
       batchSize?: number;
       priority?: 'recent';
+      includeNullSignature?: boolean;
     };
     return await runEmbedCore(engine, {
       stale: true,
@@ -2490,6 +2815,9 @@ export async function registerBuiltinHandlers(
       batchSize: data.batchSize,
       priority: data.priority,
       sourceId: data.sourceId,
+      // D7/D12: submitters that detected a NULL-signature cohort thread the
+      // widening through; absent = grandfather clause stays (unchanged).
+      includeNullSignature: !!data.includeNullSignature,
     });
   });
 
