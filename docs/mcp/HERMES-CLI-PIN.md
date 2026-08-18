@@ -12,10 +12,21 @@ file, the workflow pins, and the affected assertions together.
   version stamp; CI installs the RELEASE TAG `v2026.8.3` = commit `3c27eb62` — the two
   differ by post-release main commits, same declared version. If a CI door run ever
   diverges from these notes, re-observe against the tag checkout.)
-- Installer sha256: `868ed3a91e0fabbff6d7418b3ede82bf4833652ec4e77196a42852fb35a9e5b9`
-  (refreshed 2026-08-15: upstream installer drifted past the prior pin —
-  reviewed; the `--commit` payload-pin path the door depends on is intact,
-  and the payload pins (tag+commit) are unchanged)
+- Installer sha256: `0582d9b1562efcb6e0ac62f4451021667830b830a72ce7d91eaea9fee8b6c09b`
+  (refreshed 2026-08-18, second drift in three days — reviewed as a real diff
+  against the 868ed3a9 pin, not read blind. 150 diff lines, five clusters, all
+  defensive: `--commit` now rejects a non-hex SHA up front; a failed
+  `git fetch origin <sha>` and a failed `git checkout --detach` now return 1
+  instead of being swallowed by `|| true`; npm output is captured to a temp log
+  so a failed dep install is diagnosable; new `cua_driver_runtime_compatible()`
+  version/manifest-checks an existing cua-driver and repairs an old one. No new
+  network hosts (the endpoint set is byte-identical to the reviewed 868ed3a9).
+  The `--commit` payload-pin path the door depends on got STRICTER, not looser,
+  and the payload pins (tag+commit) are unchanged.)
+  (the stricter hard-failing fetch is not reachable on our door: the job clones
+  `--branch v2026.8.3`, so `git cat-file -e $HERMES_GIT_COMMIT` already succeeds
+  and the fetch branch is never taken. We also pass the full 40-char SHA, which
+  the new hex validator accepts.)
   (download https://hermes-agent.nousresearch.com/install.sh to a file first; verify; then run)
 - Installer flags used: `--skip-setup --non-interactive`; binary lands at `~/.local/bin/hermes`
 - Python 3.11.15 via uv
@@ -96,7 +107,7 @@ non-interactive. `hermes cron tick` = run due jobs once and exit. `hermes cron l
   `git -C ~/.hermes/hermes-agent rev-parse HEAD` and loud-fails on any mismatch, so an
   installer that silently ignores unknown flags (or a moved checkout layout) can never
   run unpinned upstream code on a runner that later holds secrets.
-- `HERMES_INSTALL_SHA256: "868ed3a91e0fabbff6d7418b3ede82bf4833652ec4e77196a42852fb35a9e5b9"`
+- `HERMES_INSTALL_SHA256: "0582d9b1562efcb6e0ac62f4451021667830b830a72ce7d91eaea9fee8b6c09b"`
 - Door test asserts `hermes --version` output contains `v$HERMES_VERSION` when the env var is set.
 - `hermes --version` output shape: `Hermes Agent v0.20.0 (2026.8.3)` + install dir + python lines.
 
