@@ -274,7 +274,7 @@ export async function runPhaseLinkChat(
       }
       // hub → chat: the chat page gains an inbound link and stops being an
       // orphan. ON CONFLICT DO NOTHING makes re-runs cheap and idempotent.
-      await engine.addLink(
+      await engine.addLink( // gbrain-allow-direct-insert: link_chat IS a cycle phase — the hub→chat edge is its reconcile output
         hubSlug,
         o.slug,
         'session capture',

@@ -140,6 +140,10 @@ const EXPECTED_PHASES: CyclePhase[] = [
   'drift',                       // #2653 — drift detection (default OFF, report-only)
   'conversation_facts_backfill', // v0.41.11.0 — opt-in conversation backfill
   'enrich_thin',                 // v0.41.39 (#1700) — brain-internal stub enrichment (default OFF)
+  // FORK DELTA (link_chat branch): auto-link orphan chat captures. Not in
+  // upstream's ALL_PHASES — an upstream merge drops it from this list, so
+  // re-insert it here rather than reordering the phase itself.
+  'link_chat',
   'skillopt',                    // v0.42.0.0 — self-evolving skills (default OFF)
   'embed',
   'orphans',

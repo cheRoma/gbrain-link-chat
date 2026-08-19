@@ -41,7 +41,7 @@ describe('PHASE_SCOPE coverage', () => {
     expect(invalid).toEqual([]);
   });
 
-  test('all 23 phases covered (regression on accidental omission)', () => {
+  test('all 24 phases covered (regression on accidental omission)', () => {
     // Pin the count so a future PR that adds a phase to ALL_PHASES
     // without updating PHASE_SCOPE notices here too. The v0.39.1.0
     // master merge brought in the 17th phase (`schema-suggest`); v0.41
@@ -49,8 +49,13 @@ describe('PHASE_SCOPE coverage', () => {
     // 'conversation_facts_backfill' (v0.41.11.0) for 20; v0.41.39 (#1700)
     // adds 'enrich_thin' and v0.42.0.0 adds 'skillopt' for a total of 22;
     // #2653 adds 'drift' for 23.
-    expect(ALL_PHASES.length).toBe(23);
-    expect(Object.keys(PHASE_SCOPE).length).toBe(23);
+    //
+    // FORK DELTA (link_chat branch): this branch carries its own
+    // 'link_chat' phase on top of upstream's set, so the count here is
+    // upstream + 1. Every merge from upstream/master reintroduces the
+    // upstream pin — re-apply this +1 instead of deleting the phase.
+    expect(ALL_PHASES.length).toBe(24);
+    expect(Object.keys(PHASE_SCOPE).length).toBe(24);
   });
 
   test('embed remains global (the headline brain-wide phase)', () => {
