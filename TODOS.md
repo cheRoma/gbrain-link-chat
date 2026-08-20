@@ -1,5 +1,38 @@
 # TODOS
 
+## Serve-delegated sync follow-ups (v0.46.24.0)
+
+- [ ] **P3 — `sync --all` under delegation.** **What:** delegate a multi-source
+  sync per-source through a live serve. **Why:** v0.46.24.0 refuses `--all`
+  under a live serve — the client has no engine to enumerate sources, and the
+  PGLite fan-out is serial anyway. **Context:** the serve could enumerate its
+  own sources and run per-source delegated jobs sequentially (the runner is
+  single-flight by design), or the client could gain a `sync_sources` IPC kind.
+  Per-source `gbrain sync --source X` delegates today, so this is convenience,
+  not capability. Start: `src/commands/sync-delegate.ts` (the `--all` refusal),
+  `src/core/serve-sync-runner.ts`. Effort: M (CC: S). Priority: P3.
+- [ ] **P3 — `serve --http` sync IPC.** **What:** register the resolve-IPC
+  listener (and the sync kinds) on the HTTP serve path. **Why:** delegation is
+  stdio-serve-only — an HTTP serve still forces stop-the-serve syncs.
+  **Context:** `src/commands/serve-http.ts` is at its module-size cap; the
+  wiring needs its own module. The IPC block in `src/mcp/server.ts:186` is the
+  shape to extract/share. Effort: M (CC: S). Priority: P3.
+- [ ] **P3 — delegated post-sync steps.** **What:** the direct-CLI post-steps
+  (`manageGitignoreAtGitRoot`, the extraction-lag nudge) don't run for
+  delegated syncs. **Why:** both need an engine or repo-adjacent context the
+  client doesn't have; both already have "defer to next clean sync" postures,
+  so nothing breaks — but a brain synced ONLY through delegation never gets
+  the .gitignore management. **Context:** run them serve-side after a done
+  job, or client-side without an engine where possible. Start:
+  `src/core/serve-sync-runner.ts` (post-done hook). Effort: S. Priority: P3.
+- [ ] **P3 — N-process delegation hammer in tests/heavy/.** **What:** a
+  `tests/heavy/serve_sync_delegation.sh` modeled on `sync_lock_regression.sh`:
+  one serve + M concurrent `gbrain sync` clients, assert one delegated job at
+  a time (`busy` for the rest), no leaked lock rows, bounded MCP latency
+  during the run. **Why:** the e2e covers the arc; the hammer covers
+  contention shapes. Effort: M. Priority: P3.
+
+
 ## Key-aware model routing wave follow-ups (filed 2026-08-17; plan: ~/.claude/plans/system-instruction-you-are-working-enchanted-lark.md)
 
 - [ ] **P2 — More providers in `PROVIDER_TIER_DEFAULTS` (+ discovery).** **What:**
@@ -359,7 +392,19 @@
 
 - [ ] **P3 — transcript.ts renderBlock still renders v2 gateway blocks as "Unknown block type".** The absorbed #4156 rekeyed the tool ledger to (message_idx, tool_use_id); teaching renderBlock the 'tool-call'/'tool-result' ChatBlock shapes is the remaining half so `gbrain agent logs` shows gateway-path tool use readably. Files: src/core/minions/transcript.ts, test/subagent-transcript.test.ts.
 
-- [ ] **P3 — consolidate the five hand-rolled bounded-wait copies.** Promise.race + setTimeout + clearTimeout now lives in hybrid.ts:151/:898, eval-capture.ts:203, supervisor.ts probeQueueState, telemetry's drain, and pglite-engine's bounded close. A shared `raceBounded(promise, ms)` helper would kill the copy-drift class. Sweep, don't rush — each copy has slightly different timeout/cleanup semantics to preserve.
+- [ ] **P3 — consolidate the five hand-rolled bounded-wait copies.** Promise.race + setTimeout + clearTimeout now lives in hybrid.ts:151/:898, eval-capture.ts:203, supervisor.ts probeQueueState, telemetry's drain, and pglite-engine's bounded close. A shared `raceBounded(promise, ms)` helper would kill the copy-drift class. Sweep, don't rush — each copy has slightly different timeout/cleanup semantics to preserve. NOTE (#4284): the pglite close copy's semantics are now deliberately divergent and load-bearing — timer armed BEFORE the awaited call starts, deliberately REF'D (no unref), delay clamped to 2^31−1 — and are pinned by structural tests in `test/fix-wave-structural.test.ts`; a sweep must preserve (or parameterize) all three, not normalize them away.
+- [ ] **P3 — enable the PGLite disconnect watchdog by default in gbrain's own CI lanes.**
+  **What:** set `GBRAIN_PGLITE_CLOSE_WATCHDOG_MS` (~30s) + `..._GRACE_MS` in the serial/e2e
+  CI lanes (and consider `scripts/run-serial-tests.sh`) after a soak period, so any future
+  #4143-class wedge dies loudly with the `pglite-disconnect-watchdog` stderr label instead
+  of eating the lane's full timeout. **Why:** the watchdog is opt-in (a diagnostic
+  instrument); today only `tests/heavy/read_latency_under_sync.sh` arms it, and the heavy
+  lane runs nightly at best — PR CI wedges would still present as silent timeouts.
+  **Context:** shipped with the #4284 fix; the lethal-knob floor
+  (`max(5000, sinkCount*2000 + closeTimeout + 2000)`) already protects healthy slow
+  teardowns, so the main soak question is worker-spawn overhead per disconnect across
+  thousands of test teardowns, and whether any lane has legitimate >30s disconnects.
+  **Effort:** S. **Priority:** P3.
 
 - [ ] **P2 — Heavy Tests lane gates nothing on in-repo branches.** #4143 shipped broken for a month because the lane comes back `skipped` on branch pushes and only a downstream fork ran it nightly. Either run a bounded subset (the read_latency workload at reduced params) in PR CI, or make the nightly failure page someone. Files: .github/workflows (heavy lane), tests/heavy/.
 
@@ -2125,7 +2170,9 @@ are the bar). Plan + GSTACK REVIEW REPORT at
   `gbrain serve` or any write path blocks on the lock until watch exits.
   WATCH_HELP documents the monopoly; the fix is an IPC rung in watch's
   resolver (reuse `resolveViaIpc` like the ambient reflex's ladder) so a
-  running serve answers and watch never takes the lock. **Why:** watch +
+  running serve answers and watch never takes the lock (v0.46.24.0's
+  serve-delegated sync built the additive-kind groundwork — `sync_start`/
+  `sync_status` in resolve-ipc.ts are the pattern to copy). **Why:** watch +
   serve concurrently is the natural agent topology. **Where:**
   `src/commands/watch.ts`, `src/core/context/resolve-ipc.ts` (red-team RT2).
 - [ ] **P3 — capability/version gate for host-injected reflex resolvers.**
