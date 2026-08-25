@@ -460,6 +460,18 @@ jobs:
       - name: Coverage summary → step summary
         run: bun scripts/render-coverage-summary.ts --summary "$RUNNER_TEMP/coverage-full-merged/summary.json" --structural scripts/structural-suites.tsv >> "$GITHUB_STEP_SUMMARY"
       - name: Baseline gate (fullCorpus, like-for-like)
+        # FORK DELTA: gated OFF in this repo. The gate reads its baseline with
+        # `git show origin/master:scripts/coverage-baseline.json`, but this
+        # fork has no master branch at all (default is feat/link-chat-distiller),
+        # so the ref never resolves and the script's infraFail exits 2 —
+        # COVERAGE_GATE_ENFORCE='0' silences the VERDICT, not an infrastructure
+        # error. That turned coverage-full-report permanently red and hid the
+        # real e2e signal next to it. Everything else in this job still runs:
+        # lanes merge, the step summary renders, the trend artifact uploads.
+        # To turn it back on, give the fork a master ref the checkout can see
+        # (branch + an explicit `git fetch origin master:refs/remotes/origin/master`)
+        # and set the repo variable GBRAIN_RUN_COVERAGE_BASELINE=true.
+        if: vars.GBRAIN_RUN_COVERAGE_BASELINE == 'true'
         # shell: bash → pipefail, so tee can't mask the gate's exit code.
         shell: bash
         env:

@@ -481,6 +481,14 @@ jobs:
           COVERAGE_GATE_ENFORCE: '0'
         run: bun scripts/coverage-diff-gate.ts --summary "$RUNNER_TEMP/coverage-merged/summary.json" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Baseline gate (prCorpus, like-for-like)
+        # FORK DELTA: gated OFF for the same reason as the fullCorpus gate in
+        # e2e.yml — the baseline lives on origin/master, which does not exist
+        # in this fork, and the resulting infraFail exits 2 past
+        # COVERAGE_GATE_ENFORCE='0'. Unlike the nightly one this lane has never
+        # actually run here (no PRs are opened against this fork), so it is
+        # disarmed pre-emptively rather than after a red run. Same escape
+        # hatch: GBRAIN_RUN_COVERAGE_BASELINE=true.
+        if: vars.GBRAIN_RUN_COVERAGE_BASELINE == 'true'
         shell: bash
         env:
           COVERAGE_GATE_ENFORCE: '0'
