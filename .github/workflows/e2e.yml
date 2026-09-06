@@ -210,7 +210,29 @@ jobs:
             echo "scheduled run — coverage-full-e2e carries the full glob tonight; nothing to select"
             exit 0
           fi
-          git fetch origin master --quiet
+          # LOCAL DELTA vs upstream — keep on merge. Upstream hardcodes
+          # `git fetch origin master`, which is fatal here: this fork has no
+          # `master` branch at all (default branch is feat/link-chat-distiller),
+          # so every workflow_dispatch died on `couldn't find remote ref master`
+          # with exit 128 before the selector ever ran. Same missing-ref hole
+          # that neutered coverage-baseline-gate below.
+          #
+          # Resolve the base from the repo's own default branch and fetch it
+          # INTO refs/remotes/origin/master, so scripts/select-e2e.ts keeps
+          # diffing `origin/master...HEAD` unchanged (no delta in the script —
+          # it re-merges cleanly). On upstream, default_branch IS master, so
+          # this is byte-equivalent to the old line.
+          BASE_BRANCH="${{ github.event.repository.default_branch }}"
+          if [ "${{ github.ref_name }}" = "$BASE_BRANCH" ]; then
+            # Diffing the default branch against itself yields nothing; say so
+            # instead of reporting a vacuous pass as a real selection.
+            echo "dispatch on the default branch ($BASE_BRANCH) — no base to diff against, so there is nothing to select; the nightly's coverage-full-e2e carries the full glob"
+            exit 0
+          fi
+          if ! git fetch origin "$BASE_BRANCH:refs/remotes/origin/master" --quiet; then
+            echo "::error::cannot fetch base branch '$BASE_BRANCH' from origin — the selector needs it to compute the diff" >&2
+            exit 1
+          fi
           # exit 2 from the selector fails this step — fail-loud by design.
           bun scripts/select-e2e.ts > /tmp/selected.txt
           # Exclusions (echoed per file, never silent): files the named jobs
@@ -218,6 +240,15 @@ jobs:
           # spenders (this job carries no provider keys, so they would
           # self-skip anyway — the list makes the spend guarantee explicit).
           EXCLUDE='test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts test/e2e/mechanical.test.ts test/e2e/mcp.test.ts test/e2e/job-isolation.test.ts test/e2e/sync-reconcile-postgres.test.ts test/e2e/engine-parity.test.ts test/e2e/serve-http-multi-agent.test.ts test/e2e/postgres-bootstrap.test.ts test/e2e/sync-delegation-under-serve.serial.test.ts test/e2e/dream-synthesize-pglite.test.ts test/e2e/skills.test.ts test/e2e/zeroentropy-live.test.ts test/e2e/voyage-rerank-live.test.ts test/e2e/voyage-multimodal.test.ts'
+          # LOCAL DELTA vs upstream — keep on merge. select-e2e.ts emits its
+          # file list SPACE-separated on a single line (`tests.join(" ")`,
+          # scripts/select-e2e.ts), but this loop read it LINE-wise: `$f` came
+          # out as the entire list, no EXCLUDE pattern ever matched, and the
+          # step reported "1 file(s)" no matter how many were selected. The
+          # exclusions (named-job duplicates + live-key spenders) were silently
+          # void — xargs word-splits, so every excluded file ran anyway.
+          # Normalise whitespace to one file per line before filtering.
+          tr -s '[:space:]' '\n' < /tmp/selected.txt > /tmp/selected-lines.txt
           : > /tmp/run.txt
           while IFS= read -r f; do
             [ -z "$f" ] && continue
@@ -225,9 +256,9 @@ jobs:
               *" $f "*) echo "excluded (named-job / live-key lane): $f" ;;
               *) echo "$f" >> /tmp/run.txt ;;
             esac
-          done < /tmp/selected.txt
+          done < /tmp/selected-lines.txt
           COUNT=$(wc -l < /tmp/run.txt | tr -d ' ')
-          echo "selector emitted $(wc -l < /tmp/selected.txt | tr -d ' ') file(s); running $COUNT after exclusions"
+          echo "selector emitted $(grep -c . /tmp/selected-lines.txt) file(s); running $COUNT after exclusions"
           if [ "$COUNT" -eq 0 ]; then
             echo "doc-only or fully-excluded diff — nothing to run here"
             exit 0
