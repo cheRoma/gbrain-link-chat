@@ -743,12 +743,18 @@ jobs:
   #
   opencode-door:
     name: opencode door e2e (${{ matrix.lane }})
+    # Fork note: this job used to sit behind GBRAIN_RUN_SECRET_DOORS because
+    # its old single-lane shape died at "Preconditions (secret present)" on a
+    # repo with no Actions secrets. Upstream since split it into lanes: the
+    # `keyless` lane (the only one selected by default) needs no secret, and
+    # the `credentialed` lane is opt-in via the run_opencode_paid dispatch
+    # input or GBRAIN_OPENCODE_PAID_E2E, failing loudly only when explicitly
+    # requested. So the job runs on the upstream condition again; only
+    # hermes-door (always credentialed) stays behind the fork variable.
     if: |
-      vars.GBRAIN_RUN_SECRET_DOORS == 'true' && (
-        github.event_name != 'pull_request' ||
-        contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
-        contains(github.event.pull_request.labels.*.name, 'heavy-tests')
-      )
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'real-agent-e2e') ||
+      contains(github.event.pull_request.labels.*.name, 'heavy-tests')
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
